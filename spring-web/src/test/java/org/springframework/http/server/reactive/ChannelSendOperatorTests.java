@@ -17,13 +17,13 @@
 package org.springframework.http.server.reactive;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
-import io.netty.buffer.ByteBufAllocator;
 import org.junit.Before;
 import org.junit.Test;
 import org.reactivestreams.Publisher;
@@ -33,10 +33,10 @@ import reactor.core.publisher.BaseSubscriber;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Signal;
+import reactor.test.StepVerifier;
 
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.LeakAwareDataBufferFactory;
-import org.springframework.core.io.buffer.NettyDataBufferFactory;
 
 import static org.junit.Assert.*;
 
@@ -133,8 +133,7 @@ public class ChannelSendOperatorTests {
 
 	@Test // gh-22720
 	public void cancelWhileItemCached() {
-		NettyDataBufferFactory delegate = new NettyDataBufferFactory(ByteBufAllocator.DEFAULT);
-		LeakAwareDataBufferFactory bufferFactory = new LeakAwareDataBufferFactory(delegate);
+		LeakAwareDataBufferFactory bufferFactory = new LeakAwareDataBufferFactory();
 
 		ChannelSendOperator<DataBuffer> operator = new ChannelSendOperator<>(
 				Mono.fromCallable(() -> {
@@ -156,9 +155,13 @@ public class ChannelSendOperatorTests {
 	}
 
 	@Test // gh-22720
-	public void errorWhileItemCached() {
-		NettyDataBufferFactory delegate = new NettyDataBufferFactory(ByteBufAllocator.DEFAULT);
-		LeakAwareDataBufferFactory bufferFactory = new LeakAwareDataBufferFactory(delegate);
+	public void errorFromWriteSourceWhileItemCached() {
+
+		// 1. First item received
+		// 2. writeFunction applied and writeCompletionBarrier subscribed to it
+		// 3. Write Publisher fails right after that and before request(n) from server
+
+		LeakAwareDataBufferFactory bufferFactory = new LeakAwareDataBufferFactory();
 		ZeroDemandSubscriber writeSubscriber = new ZeroDemandSubscriber();
 
 		ChannelSendOperator<DataBuffer> operator = new ChannelSendOperator<>(
@@ -186,6 +189,29 @@ public class ChannelSendOperatorTests {
 		bufferFactory.checkForLeaks();
 	}
 
+	@Test // gh-22720
+	public void errorFromWriteFunctionWhileItemCached() {
+
+		// 1. First item received
+		// 2. writeFunction applied and writeCompletionBarrier subscribed to it
+		// 3. writeFunction fails, e.g. to flush status and headers, before request(n) from server
+
+		LeakAwareDataBufferFactory bufferFactory = new LeakAwareDataBufferFactory();
+
+		ChannelSendOperator<DataBuffer> operator = new ChannelSendOperator<>(
+				Flux.create(sink -> {
+					DataBuffer dataBuffer = bufferFactory.allocateBuffer();
+					dataBuffer.write("foo", StandardCharsets.UTF_8);
+					sink.next(dataBuffer);
+				}),
+				publisher -> {
+					publisher.subscribe(new ZeroDemandSubscriber());
+					return Mono.error(new IllegalStateException("err"));
+				});
+
+		StepVerifier.create(operator).expectErrorMessage("err").verify(Duration.ofSeconds(5));
+		bufferFactory.checkForLeaks();
+	}
 
 	private <T> Mono<Void> sendOperator(Publisher<String> source){
 		return new ChannelSendOperator<>(source, writer::send);
